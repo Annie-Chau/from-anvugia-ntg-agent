@@ -32,6 +32,8 @@ public class AgentService
     private readonly IDocumentAnalysisService _documentAnalysisService;
     private readonly ILogger<AgentService> _logger;
     private const int MAX_LATEST_MESSAGE_TO_KEEP_FULL = 5;
+    private static readonly TimeSpan ConversationNameGenerationTimeout = TimeSpan.FromSeconds(15);
+    private const int FallbackConversationNameMaxLength = 50;
 
     public AgentService(
         IAgentFactory agentFactory,
@@ -95,7 +97,27 @@ public class AgentService
         {
             var nameTokenUsage = new TokenUsageInfo();
             var nameStart = DateTime.UtcNow;
-            conversation.Name = await GenerateConversationName(promptRequest.Prompt, nameTokenUsage);
+            // A hang here blocks the entire chat stream (nothing is yielded to the client until the
+            // first yield return below), so we time-box the naming call and fall back to a truncated
+            // version of the prompt when the LLM provider is slow or unresponsive.
+            using var nameCts = new CancellationTokenSource(ConversationNameGenerationTimeout);
+            try
+            {
+                conversation.Name = await GenerateConversationName(promptRequest.Prompt, nameTokenUsage, nameCts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning(
+                    "Conversation name generation timed out after {TimeoutSeconds}s for conversation {ConversationId}; using fallback name.",
+                    ConversationNameGenerationTimeout.TotalSeconds,
+                    conversation.Id);
+                conversation.Name = BuildFallbackConversationName(promptRequest.Prompt);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Conversation name generation failed for conversation {ConversationId}; using fallback name.", conversation.Id);
+                conversation.Name = BuildFallbackConversationName(promptRequest.Prompt);
+            }
             _agentDbContext.Conversations.Update(conversation);
             await _agentDbContext.SaveChangesAsync();
             await TrackTokenUsageAsync(userId, promptRequest.SessionId, promptRequest.AgentId, new ConversationListItem(conversation.Id, conversation.Name), null, OperationTypes.GenerateName, nameTokenUsage, DateTime.UtcNow - nameStart);
@@ -414,12 +436,25 @@ public class AgentService
 
     }
 
-    private async Task<string> GenerateConversationName(string question, TokenUsageInfo tokenUsageInfo)
+    private async Task<string> GenerateConversationName(string question, TokenUsageInfo tokenUsageInfo, CancellationToken cancellationToken = default)
     {
         var agent = await _agentFactory.CreateBasicAgent("Generate a short, descriptive conversation name (≤ 5 words).");
-        var results = await agent.RunAsync(question);
+        var results = await agent.RunAsync(question, cancellationToken: cancellationToken);
         ExtractTokenUsage(results.Usage, tokenUsageInfo);
         return results.Text;
+    }
+
+    private static string BuildFallbackConversationName(string prompt)
+    {
+        if (string.IsNullOrWhiteSpace(prompt))
+        {
+            return "New Conversation";
+        }
+
+        var trimmed = prompt.Trim();
+        return trimmed.Length <= FallbackConversationNameMaxLength
+            ? trimmed
+            : trimmed.Substring(0, FallbackConversationNameMaxLength) + "…";
     }
 
     private async Task<string> SummarizeMessagesAsync(List<PChatMessage> messages, TokenUsageInfo tokenUsageInfo)
