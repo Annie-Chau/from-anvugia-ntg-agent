@@ -33,7 +33,7 @@ public class AgentService
     private readonly ILogger<AgentService> _logger;
     private const int MAX_LATEST_MESSAGE_TO_KEEP_FULL = 5;
     private static readonly TimeSpan ConversationNameGenerationTimeout = TimeSpan.FromSeconds(15);
-    private static readonly TimeSpan LlmResponseTimeout = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan LlmResponseTimeout = TimeSpan.FromSeconds(120);
     private const int FallbackConversationNameMaxLength = 50;
 
     public AgentService(
