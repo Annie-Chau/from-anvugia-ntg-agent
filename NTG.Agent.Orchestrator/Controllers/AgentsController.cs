@@ -69,6 +69,10 @@ public class AgentsController : ControllerBase
                 Message = $"Your prompt requires ~{quotaResult.EstimatedTokens} tokens, but you only have {quotaResult.RemainingTokens} tokens left in your {_settings.ResetPeriodHours}-hour window.",
                 RemainingTokens = quotaResult.RemainingTokens
             });
+        } else {
+            _logger.LogWarning(
+                "QUOTA NOT EXHAUSTED: User {UserId} / Remaining: {RemainingTokens} for Session {SessionId}.",
+                userId, quotaResult.RemainingTokens, sessionId);
         }
 
         return Ok(_agentService.ChatStreamingAsync(userId, promptRequest));

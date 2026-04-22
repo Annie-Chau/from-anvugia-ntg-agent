@@ -33,7 +33,7 @@ public class AgentService
     private readonly ILogger<AgentService> _logger;
     private const int MAX_LATEST_MESSAGE_TO_KEEP_FULL = 5;
     private static readonly TimeSpan ConversationNameGenerationTimeout = TimeSpan.FromSeconds(15);
-    private static readonly TimeSpan LlmResponseTimeout = TimeSpan.FromSeconds(120);
+    private static readonly TimeSpan LlmResponseTimeout = TimeSpan.FromSeconds(60);
     private const int FallbackConversationNameMaxLength = 50;
 
     public AgentService(
@@ -134,40 +134,58 @@ public class AgentService
 
         string? llmTimeoutMessage = null;
         using var llmCts = new CancellationTokenSource(LlmResponseTimeout);
-        try
+        await using var enumerator = InvokePromptStreamingInternalAsync(
+                promptRequest,
+                history,
+                tags,
+                ocrDocuments,
+                tokenUsageInfo,
+                userId,
+                llmCts.Token)
+            .GetAsyncEnumerator(llmCts.Token);
+
+        while (true)
         {
-            await foreach (var item in InvokePromptStreamingInternalAsync(promptRequest, history, tags, ocrDocuments, tokenUsageInfo, userId, llmCts.Token))
+            PromptResponse? item = null;
+
+            try
             {
-                if (item.ContentType == PromptContentType.Thinking)
-                {
-                    // Record the start timestamp on the first thinking chunk
-                    thinkingStartedAt ??= DateTime.UtcNow;
-                    thinkingMessageSb.Append(item.Content);
-                }
-                else
-                {
-                    // Record the end timestamp on the first non-thinking chunk after thinking started
-                    if (thinkingStartedAt.HasValue && !thinkingEndedAt.HasValue)
-                        thinkingEndedAt = DateTime.UtcNow;
-                    agentMessageSb.Append(item.Content);
-                }
+                if (!await enumerator.MoveNextAsync())
+                    break;
 
-                yield return item;
+                item = enumerator.Current;
             }
-        }
-        catch (OperationCanceledException) when (llmCts.IsCancellationRequested)
-        {
-            _logger.LogWarning(
-                "LLM response timed out after {Timeout}s for conversation {ConversationId}.",
-                LlmResponseTimeout.TotalSeconds,
-                conversation.Id);
-            llmTimeoutMessage = agentMessageSb.Length > 0
-                ? "\n\n*(Response timed out — partial content above.)*"
-                : "⚠️ The AI provider did not respond in time. Please try again.";
-            agentMessageSb.Append(llmTimeoutMessage);
+            catch (OperationCanceledException) when (llmCts.IsCancellationRequested)
+            {
+                _logger.LogWarning(
+                    "LLM response timed out after {Timeout}s for conversation {ConversationId}.",
+                    LlmResponseTimeout.TotalSeconds,
+                    conversation.Id);
+                llmTimeoutMessage = agentMessageSb.Length > 0
+                    ? "\n\n*(Response timed out — partial content above.)*"
+                    : "⚠️ The AI provider did not respond in time. Please try again.";
+                agentMessageSb.Append(llmTimeoutMessage);
+                break;
+            }
+
+            if (item.ContentType == PromptContentType.Thinking)
+            {
+                // Record the start timestamp on the first thinking chunk
+                thinkingStartedAt ??= DateTime.UtcNow;
+                thinkingMessageSb.Append(item.Content);
+            }
+            else
+            {
+                // Record the end timestamp on the first non-thinking chunk after thinking started
+                if (thinkingStartedAt.HasValue && !thinkingEndedAt.HasValue)
+                    thinkingEndedAt = DateTime.UtcNow;
+                agentMessageSb.Append(item.Content);
+            }
+
+            yield return item;
         }
 
-        // Yield the timeout notice outside the try-catch so it is not subject to catch-block yield restrictions.
+        // Yield the timeout notice after the loop so it's not inside a try/catch.
         if (llmTimeoutMessage != null)
             yield return new PromptResponse(llmTimeoutMessage);
 
@@ -563,3 +581,5 @@ public class AgentService
         await _agentDbContext.SaveChangesAsync();
     }
 }
+
+// NTG.Agent.Orchestrator.Controllers.PreferencesController.SavePreference
