@@ -94,35 +94,12 @@ public class AgentService
             ocrDocuments = await _documentAnalysisService.ExtractDocumentData(promptRequest.Documents);
         }
 
-        if (conversation.Name == "New Conversation")
-        {
-            var nameTokenUsage = new TokenUsageInfo();
-            var nameStart = DateTime.UtcNow;
-            // A hang here blocks the entire chat stream (nothing is yielded to the client until the
-            // first yield return below), so we time-box the naming call and fall back to a truncated
-            // version of the prompt when the LLM provider is slow or unresponsive.
-            using var nameCts = new CancellationTokenSource(ConversationNameGenerationTimeout);
-            try
-            {
-                conversation.Name = await GenerateConversationName(promptRequest.Prompt, nameTokenUsage, nameCts.Token);
-            }
-            catch (OperationCanceledException)
-            {
-                _logger.LogWarning(
-                    "Conversation name generation timed out after {TimeoutSeconds}s for conversation {ConversationId}; using fallback name.",
-                    ConversationNameGenerationTimeout.TotalSeconds,
-                    conversation.Id);
-                conversation.Name = BuildFallbackConversationName(promptRequest.Prompt);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Conversation name generation failed for conversation {ConversationId}; using fallback name.", conversation.Id);
-                conversation.Name = BuildFallbackConversationName(promptRequest.Prompt);
-            }
-            _agentDbContext.Conversations.Update(conversation);
-            await _agentDbContext.SaveChangesAsync();
-            await TrackTokenUsageAsync(userId, promptRequest.SessionId, promptRequest.AgentId, new ConversationListItem(conversation.Id, conversation.Name), null, OperationTypes.GenerateName, nameTokenUsage, DateTime.UtcNow - nameStart);
-        }
+        // Conversation name generation is deferred until after the main chat stream completes.
+        // Rationale: the upstream LLM provider (GitHub Models) enforces per-user-per-model-per-day
+        // rate limits. Running the name-gen call concurrently with — or before — the user's prompt
+        // doubles the request count against the same bucket and lets a stalled name-gen block the
+        // user-visible response. Deferring it means the user's prompt always gets the first
+        // upstream slot, and the name-gen call is only issued after we have a successful answer.
 
         // Track text and thinking content separately — thinking is persisted but excluded from AI history
         var agentMessageSb = new StringBuilder();
@@ -217,6 +194,23 @@ public class AgentService
             var hasThinking = tokenUsageInfo.ReasoningTokens > 0 || thinkingMessageSb.Length > 0;
             var chatOperationType = hasThinking ? OperationTypes.Reasoning : OperationTypes.Chat;
             await TrackTokenUsageAsync(userId, promptRequest.SessionId, promptRequest.AgentId, new ConversationListItem(conversation.Id, conversation.Name), savedMessage.Id, chatOperationType, tokenUsageInfo, responseTime);
+
+            // Generate the conversation name now that the chat response is complete.
+            // Guard conditions (see TryGenerateAndSaveConversationNameAsync for the canonical check):
+            //   - Skip when the chat stream itself timed out — the provider is already rate-limited
+            //     or unresponsive, so a name-gen call would just waste another quota slot.
+            //   - Skip when the name has already been set by a previous turn, so each conversation
+            //     only ever triggers name-gen once.
+            if (llmTimeoutMessage == null)
+            {
+                await TryGenerateAndSaveConversationNameAsync(userId, promptRequest, conversation);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "Skipping conversation name generation for conversation {ConversationId}: chat stream timed out, preserving remaining upstream quota.",
+                    conversation.Id);
+            }
 
             if (userId is Guid userGuid)
             {
@@ -326,6 +320,77 @@ public class AgentService
         await _agentDbContext.SaveChangesAsync();
 
         return assistantMessage;
+    }
+
+    // Generates (at most once per conversation) a short human-readable name for a conversation.
+    // Called *after* the main chat stream completes so the user's prompt gets the first upstream
+    // slot and does not share a rate-limit bucket with this auxiliary call.
+    //
+    // Idempotency guard: we only run when the conversation still carries the default placeholder
+    // name "New Conversation". After the first successful run (or fallback), this check fails on
+    // every subsequent turn, which is exactly the "trigger only once per conversation" contract.
+    private async Task TryGenerateAndSaveConversationNameAsync(
+        Guid? userId,
+        PromptRequestForm promptRequest,
+        Conversation conversation)
+    {
+        if (conversation.Name != "New Conversation")
+        {
+            _logger.LogDebug(
+                "Conversation name generation skipped for conversation {ConversationId}: name already set to '{ExistingName}'.",
+                conversation.Id, conversation.Name);
+            return;
+        }
+
+        _logger.LogInformation(
+            "Conversation name generation started for conversation {ConversationId} (post-stream, sequential after chat response).",
+            conversation.Id);
+
+        var nameTokenUsage = new TokenUsageInfo();
+        var nameStart = DateTime.UtcNow;
+        using var nameCts = new CancellationTokenSource(ConversationNameGenerationTimeout);
+
+        try
+        {
+            conversation.Name = await GenerateConversationName(promptRequest.Prompt, nameTokenUsage, nameCts.Token);
+            _logger.LogInformation(
+                "Conversation name generation succeeded for conversation {ConversationId} in {ElapsedMs}ms; name='{Name}'.",
+                conversation.Id,
+                (long)(DateTime.UtcNow - nameStart).TotalMilliseconds,
+                conversation.Name);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning(
+                "Conversation name generation timed out after {TimeoutSeconds}s for conversation {ConversationId}; using fallback name derived from the user's prompt.",
+                ConversationNameGenerationTimeout.TotalSeconds,
+                conversation.Id);
+            conversation.Name = BuildFallbackConversationName(promptRequest.Prompt);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Conversation name generation failed for conversation {ConversationId}; using fallback name derived from the user's prompt.",
+                conversation.Id);
+            conversation.Name = BuildFallbackConversationName(promptRequest.Prompt);
+        }
+
+        _agentDbContext.Conversations.Update(conversation);
+        await _agentDbContext.SaveChangesAsync();
+        _logger.LogInformation(
+            "Conversation name persisted for conversation {ConversationId}; final name='{Name}'.",
+            conversation.Id, conversation.Name);
+
+        await TrackTokenUsageAsync(
+            userId,
+            promptRequest.SessionId,
+            promptRequest.AgentId,
+            new ConversationListItem(conversation.Id, conversation.Name),
+            null,
+            OperationTypes.GenerateName,
+            nameTokenUsage,
+            DateTime.UtcNow - nameStart);
     }
 
     private async IAsyncEnumerable<PromptResponse> InvokePromptStreamingInternalAsync(
