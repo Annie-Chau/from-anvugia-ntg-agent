@@ -33,6 +33,7 @@ public class AgentService
     private readonly ILogger<AgentService> _logger;
     private const int MAX_LATEST_MESSAGE_TO_KEEP_FULL = 5;
     private static readonly TimeSpan ConversationNameGenerationTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan LlmResponseTimeout = TimeSpan.FromSeconds(120);
     private const int FallbackConversationNameMaxLength = 50;
 
     public AgentService(
@@ -131,24 +132,44 @@ public class AgentService
         DateTime? thinkingStartedAt = null;
         DateTime? thinkingEndedAt = null;
 
-        await foreach (var item in InvokePromptStreamingInternalAsync(promptRequest, history, tags, ocrDocuments, tokenUsageInfo, userId))
+        string? llmTimeoutMessage = null;
+        using var llmCts = new CancellationTokenSource(LlmResponseTimeout);
+        try
         {
-            if (item.ContentType == PromptContentType.Thinking)
+            await foreach (var item in InvokePromptStreamingInternalAsync(promptRequest, history, tags, ocrDocuments, tokenUsageInfo, userId, llmCts.Token))
             {
-                // Record the start timestamp on the first thinking chunk
-                thinkingStartedAt ??= DateTime.UtcNow;
-                thinkingMessageSb.Append(item.Content);
-            }
-            else
-            {
-                // Record the end timestamp on the first non-thinking chunk after thinking started
-                if (thinkingStartedAt.HasValue && !thinkingEndedAt.HasValue)
-                    thinkingEndedAt = DateTime.UtcNow;
-                agentMessageSb.Append(item.Content);
-            }
+                if (item.ContentType == PromptContentType.Thinking)
+                {
+                    // Record the start timestamp on the first thinking chunk
+                    thinkingStartedAt ??= DateTime.UtcNow;
+                    thinkingMessageSb.Append(item.Content);
+                }
+                else
+                {
+                    // Record the end timestamp on the first non-thinking chunk after thinking started
+                    if (thinkingStartedAt.HasValue && !thinkingEndedAt.HasValue)
+                        thinkingEndedAt = DateTime.UtcNow;
+                    agentMessageSb.Append(item.Content);
+                }
 
-            yield return item;
+                yield return item;
+            }
         }
+        catch (OperationCanceledException) when (llmCts.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                "LLM response timed out after {Timeout}s for conversation {ConversationId}.",
+                LlmResponseTimeout.TotalSeconds,
+                conversation.Id);
+            llmTimeoutMessage = agentMessageSb.Length > 0
+                ? "\n\n*(Response timed out — partial content above.)*"
+                : "⚠️ The AI provider did not respond in time. Please try again.";
+            agentMessageSb.Append(llmTimeoutMessage);
+        }
+
+        // Yield the timeout notice outside the try-catch so it is not subject to catch-block yield restrictions.
+        if (llmTimeoutMessage != null)
+            yield return new PromptResponse(llmTimeoutMessage);
 
         var responseTime = DateTime.UtcNow - startTime;
         // Calculate thinking duration; falls back to end-of-stream if no non-thinking chunk followed
@@ -295,7 +316,8 @@ public class AgentService
         List<string> tags,
         List<string> ocrDocuments,
         TokenUsageInfo tokenUsageInfo,
-        Guid? userId)
+        Guid? userId,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         if (promptRequest.AgentId == new Guid("760887e0-babd-41ae-aec1-b6ac3803d348"))
         {
@@ -331,7 +353,7 @@ public class AgentService
                 Tools = [memorySearch]
             };
 
-            await foreach (var update in agent.RunStreamingAsync(chatHistory, options: new ChatClientAgentRunOptions(chatOptions)))
+            await foreach (var update in agent.RunStreamingAsync(chatHistory, options: new ChatClientAgentRunOptions(chatOptions)).WithCancellation(cancellationToken))
             {
                 foreach (var item in update.Contents)
                 {
