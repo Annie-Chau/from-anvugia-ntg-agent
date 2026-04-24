@@ -20,7 +20,6 @@ using OpenTelemetry.Trace;
 using System.Diagnostics;
 using System.Diagnostics.Metrics;
 using NTG.Agent.Orchestrator.Services.Quota;
-using NTG.Agent.Orchestrator.Models.Quota;
 
 const string SourceName = "NTG.Agent.Orchestrator";
 const string ServiceName = "Orchestrator";

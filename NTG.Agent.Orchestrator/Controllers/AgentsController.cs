@@ -7,7 +7,7 @@ using NTG.Agent.Orchestrator.Data;
 using NTG.Agent.Orchestrator.Dtos;
 using NTG.Agent.Orchestrator.Extentions;
 using NTG.Agent.Orchestrator.Services.Quota;
-using NTG.Agent.Orchestrator.Models.Quota;
+using NTG.Agent.Orchestrator.Models.Configuration;
 using Microsoft.Extensions.Options;
 
 namespace NTG.Agent.Orchestrator.Controllers;

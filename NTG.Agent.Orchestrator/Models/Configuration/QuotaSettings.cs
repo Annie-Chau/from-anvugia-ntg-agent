@@ -1,4 +1,4 @@
-namespace NTG.Agent.Orchestrator.Models.Quota;
+namespace NTG.Agent.Orchestrator.Models.Configuration;
 
 public class QuotaSettings
 {

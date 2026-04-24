@@ -1,14 +1,9 @@
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Logging;
-using NTG.Agent.Orchestrator.Models.Quota;
+using NTG.Agent.Orchestrator.Models.Configuration;
 using NTG.Agent.Orchestrator.Services.TokenTracking;
 
 namespace NTG.Agent.Orchestrator.Services.Quota;
-
-public interface IUserQuotaService
-{
-    Task<QuotaCheckResult> CheckQuotaAsync(Guid? userId, Guid? sessionId, string promptText);
-}
 
 public class UserQuotaService : IUserQuotaService
 {
@@ -17,18 +12,18 @@ public class UserQuotaService : IUserQuotaService
     private readonly ILogger<UserQuotaService> _logger;
 
     public UserQuotaService(
-        ITokenTrackingService tokenTrackingService, 
+        ITokenTrackingService tokenTrackingService,
         IOptions<QuotaSettings> settings,
-        ILogger<UserQuotaService> logger) 
+        ILogger<UserQuotaService> logger)
     {
         _tokenTrackingService = tokenTrackingService;
         _settings = settings.Value;
-        _logger = logger; 
+        _logger = logger;
     }
 
     public async Task<QuotaCheckResult> CheckQuotaAsync(Guid? userId, Guid? sessionId, string promptText)
     {
-        if (!_settings.IsEnabled) 
+        if (!_settings.IsEnabled)
             return new QuotaCheckResult(true, 0, long.MaxValue, null);
 
         // 1. Estimate the cost of the incoming prompt
@@ -39,9 +34,9 @@ public class UserQuotaService : IUserQuotaService
 
         // 3. Get actual usage strictly within that window
         var stats = await _tokenTrackingService.GetUsageStatsAsync(
-            userId: userId, 
-            sessionId: sessionId, 
-            fromDate: fromDate, 
+            userId: userId,
+            sessionId: sessionId,
+            fromDate: fromDate,
             toDate: DateTime.UtcNow);
 
         // 4. Determine which limit applies
@@ -59,16 +54,16 @@ public class UserQuotaService : IUserQuotaService
                 userId, sessionId, estimatedPromptTokens, remainingTokens);
 
             return new QuotaCheckResult(
-                IsAllowed: false, 
-                EstimatedTokens: estimatedPromptTokens, 
-                RemainingTokens: remainingTokens < 0 ? 0 : remainingTokens, 
+                IsAllowed: false,
+                EstimatedTokens: estimatedPromptTokens,
+                RemainingTokens: remainingTokens < 0 ? 0 : remainingTokens,
                 BlockReason: "quota_exhausted"
             );
         }
 
         // Log remaining balance when they are allowed
         _logger.LogInformation(
-            "QUOTA CHECK: User {UserId} has {RemainingTokens} tokens remaining in their rolling window.", 
+            "QUOTA CHECK: User {UserId} has {RemainingTokens} tokens remaining in their rolling window.",
             userId, remainingTokens);
 
         return new QuotaCheckResult(true, estimatedPromptTokens, remainingTokens, null);
