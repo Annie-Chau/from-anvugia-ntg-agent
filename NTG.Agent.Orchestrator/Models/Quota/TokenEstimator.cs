@@ -6,7 +6,7 @@ public static class TokenEstimator
 {
     // GPT-4/GPT-3.5 use the cl100k_base encoding. 
     // This is a fast, offline way to estimate tokens
-    private static readonly Tokenizer _tokenizer = TiktokenTokenizer.CreateForModel("gpt-4");
+    private static readonly Tokenizer _tokenizer = TiktokenTokenizer.CreateForModel("gpt-4.1");
 
     public static int EstimateTokens(string text)
     {
